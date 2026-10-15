@@ -1,0 +1,1388 @@
+diff --git a/configure b/configure
+index 26e224a0..d7ea7474 100755
+--- a/configure
++++ b/configure
+@@ -23562,6 +23562,7 @@ wine_fn_config_makefile programs/certutil enable_certutil
+ wine_fn_config_makefile programs/chcp.com enable_chcp_com
+ wine_fn_config_makefile programs/clock enable_clock
+ wine_fn_config_makefile programs/cmd enable_cmd
++wine_fn_config_makefile programs/csrss enable_csrss
+ wine_fn_config_makefile programs/cmd/tests enable_tests
+ wine_fn_config_makefile programs/conhost enable_conhost
+ wine_fn_config_makefile programs/conhost/tests enable_tests
+@@ -23609,6 +23610,7 @@ wine_fn_config_makefile programs/notepad enable_notepad
+ wine_fn_config_makefile programs/oleview enable_oleview
+ wine_fn_config_makefile programs/ping enable_ping
+ wine_fn_config_makefile programs/plugplay enable_plugplay
++wine_fn_config_makefile programs/lsass enable_lsass
+ wine_fn_config_makefile programs/pnputil enable_pnputil
+ wine_fn_config_makefile programs/powershell enable_powershell
+ wine_fn_config_makefile programs/presentationfontcache enable_presentationfontcache
+diff --git a/configure.ac b/configure.ac
+index bf8e3c05..5a810660 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -3559,6 +3559,7 @@ WINE_CONFIG_MAKEFILE(programs/certutil)
+ WINE_CONFIG_MAKEFILE(programs/chcp.com)
+ WINE_CONFIG_MAKEFILE(programs/clock)
+ WINE_CONFIG_MAKEFILE(programs/cmd)
++WINE_CONFIG_MAKEFILE(programs/csrss)
+ WINE_CONFIG_MAKEFILE(programs/cmd/tests)
+ WINE_CONFIG_MAKEFILE(programs/conhost)
+ WINE_CONFIG_MAKEFILE(programs/conhost/tests)
+@@ -3606,6 +3607,7 @@ WINE_CONFIG_MAKEFILE(programs/notepad)
+ WINE_CONFIG_MAKEFILE(programs/oleview)
+ WINE_CONFIG_MAKEFILE(programs/ping)
+ WINE_CONFIG_MAKEFILE(programs/plugplay)
++WINE_CONFIG_MAKEFILE(programs/lsass)
+ WINE_CONFIG_MAKEFILE(programs/pnputil)
+ WINE_CONFIG_MAKEFILE(programs/powershell)
+ WINE_CONFIG_MAKEFILE(programs/presentationfontcache)
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+index 1f550a60..78b26476 100644
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -2367,6 +2367,18 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class,
+         SERVER_END_REQ;
+         break;
+ 
++    case ProcessWineSessionId:
++        if (size != sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
++        SERVER_START_REQ( set_process_session )
++        {
++            req->handle = wine_server_obj_handle( handle );
++            req->session_id = *(const ULONG *)info;
++            ret = wine_server_call( req );
++        }
++        SERVER_END_REQ;
++        if (!ret && handle == GetCurrentProcess()) peb->SessionId = *(const ULONG *)info;
++        break;
++
+     case ProcessPowerThrottlingState:
+         FIXME( "ProcessPowerThrottlingState - stub\n" );
+         return STATUS_SUCCESS;
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index 438e671d..dd1e4a45 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -3424,13 +3424,38 @@ NTSTATUS WINAPI NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class,
+         {
+             "\\SystemRoot\\system32\\ntoskrnl.exe",
+             "\\SystemRoot\\system32\\hal.dll",
+-            "\\SystemRoot\\system32\\drivers\\mountmgr.sys"
+         };
+ 
+-        ULONG i;
++        static const char driver_prefix[] = "\\SystemRoot\\system32\\drivers\\";
++
++        ULONG i, count;
+         RTL_PROCESS_MODULES *smi = info;
++        char *buffer = NULL;
++        data_size_t buffer_size = 0, pos = 0;
++        unsigned int module_count = 0;
++
++        /* query with no buffer first, the reply tells us how much is needed */
++        SERVER_START_REQ( list_kernel_modules )
++        {
++            wine_server_set_reply( req, NULL, 0 );
++            if (wine_server_call( req ) == STATUS_INFO_LENGTH_MISMATCH)
++                buffer_size = reply->info_size;
++        }
++        SERVER_END_REQ;
+ 
+-        len = offsetof( RTL_PROCESS_MODULES, Modules[ARRAY_SIZE(fake_modules)] );
++        if (buffer_size && (buffer = malloc( buffer_size )))
++        {
++            SERVER_START_REQ( list_kernel_modules )
++            {
++                wine_server_set_reply( req, buffer, buffer_size );
++                if (!wine_server_call( req )) module_count = reply->module_count;
++                else buffer_size = 0;
++            }
++            SERVER_END_REQ;
++        }
++
++        count = ARRAY_SIZE(fake_modules) + module_count;
++        len = offsetof( RTL_PROCESS_MODULES, Modules[count] );
+         if (len <= size)
+         {
+             memset( smi, 0, len );
+@@ -3444,10 +3469,34 @@ NTSTATUS WINAPI NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class,
+                 strcpy( (char *)sm->Name, fake_modules[i] );
+                 sm->NameOffset = strrchr( fake_modules[i], '\\' ) - fake_modules[i] + 1;
+             }
+-            smi->ModulesCount = i;
++            for (i = 0; i < module_count; i++)
++            {
++                const struct kernel_module_info *km = (const struct kernel_module_info *)(buffer + pos);
++                RTL_PROCESS_MODULE_INFORMATION *sm = &smi->Modules[ARRAY_SIZE(fake_modules) + i];
++                const WCHAR *module_name = (const WCHAR *)(km + 1);
++                unsigned int name_chars = km->name_len / sizeof(WCHAR);
++                unsigned int written = sizeof(driver_prefix) - 1;
++                unsigned int src;
++
++                sm->ImageBaseAddress = wine_server_get_ptr( km->base );
++                sm->ImageSize = km->size;
++                sm->LoadOrderIndex = ARRAY_SIZE(fake_modules) + i;
++                sm->LoadCount = 1;
++
++                strcpy( (char *)sm->Name, driver_prefix );
++                for (src = 0; src < name_chars && written < MAXIMUM_FILENAME_LENGTH - 5; src++)
++                    sm->Name[written++] = (char)module_name[src];
++                strcpy( (char *)sm->Name + written, ".sys" );
++                sm->NameOffset = sizeof(driver_prefix) - 1;
++
++                pos += (sizeof(*km) + km->name_len + sizeof(client_ptr_t)-1)
++                       / sizeof(client_ptr_t) * sizeof(client_ptr_t);
++            }
++            smi->ModulesCount = count;
+         }
+         else ret = STATUS_INFO_LENGTH_MISMATCH;
+ 
++        free( buffer );
+         break;
+     }
+ 
+diff --git a/dlls/ntoskrnl.exe/instr.c b/dlls/ntoskrnl.exe/instr.c
+index 03f48152..ddb856a6 100644
+--- a/dlls/ntoskrnl.exe/instr.c
++++ b/dlls/ntoskrnl.exe/instr.c
+@@ -923,6 +923,15 @@ LONG CALLBACK vectored_handler( EXCEPTION_POINTERS *ptrs )
+     EXCEPTION_RECORD *record = ptrs->ExceptionRecord;
+     CONTEXT *context = ptrs->ContextRecord;
+ 
++    /* kernelmode rip */
++    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && (context->Rip & 0x0000800000000000))
++    {
++        TRACE( "converting kernelmode rip=%Ix\n", context->Rip );
++        context->Rip &= 0x00007FFFFFFFFFFF;
++        TRACE( "resuming on rip=%Ix\n", context->Rip );
++        return EXCEPTION_CONTINUE_EXECUTION;
++    }
++
+     if (record->ExceptionCode == EXCEPTION_PRIV_INSTRUCTION ||
+         (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+          record->ExceptionInformation[0] == EXCEPTION_READ_FAULT))
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.c b/dlls/ntoskrnl.exe/ntoskrnl.c
+index a6d728d3..392d44ce 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.c
++++ b/dlls/ntoskrnl.exe/ntoskrnl.c
+@@ -889,6 +889,7 @@ static void unload_driver( struct wine_rb_entry *entry, void *context )
+     struct wine_driver *driver = WINE_RB_ENTRY_VALUE( entry, struct wine_driver, entry );
+     SERVICE_STATUS_HANDLE service_handle = driver->service_handle;
+     LDR_DATA_TABLE_ENTRY *ldr;
++    client_ptr_t base;
+ 
+     if (!service_handle) return;    /* not a service */
+ 
+@@ -901,6 +902,7 @@ static void unload_driver( struct wine_rb_entry *entry, void *context )
+     }
+ 
+     ldr = driver->driver_obj.DriverSection;
++    base = wine_server_client_ptr( driver->driver_obj.DriverStart );
+ 
+     set_service_status( service_handle, SERVICE_STOP_PENDING, 0 );
+ 
+@@ -910,6 +912,13 @@ static void unload_driver( struct wine_rb_entry *entry, void *context )
+ 
+     TRACE_(relay)( "\1Ret  driver unload %p (obj=%p)\n", driver->driver_obj.DriverUnload, &driver->driver_obj );
+ 
++    SERVER_START_REQ( unregister_kernel_module )
++    {
++        req->base = base;
++        wine_server_call( req );
++    }
++    SERVER_END_REQ;
++
+     FreeLibrary( ldr->DllBase );
+     IoDeleteDriver( &driver->driver_obj );
+ 
+@@ -1204,6 +1213,87 @@ PVOID WINAPI IoAllocateErrorLogEntry( PVOID IoObject, UCHAR EntrySize )
+ }
+ 
+ 
++/* dirty way to postpone drivers from unmapping sections while a locked MDL still uses it */
++struct mapped_view
++{
++    struct list entry;
++    MDL *mdl;
++    void *pending_unmap;
++};
++
++/* i dont really know other ways to do this.. */
++static struct list mapped_views = LIST_INIT( mapped_views );
++DECLARE_CRITICAL_SECTION(mapped_views_cs);
++static struct mapped_view *find_mapped_view( const void *addr )
++{
++    struct mapped_view *view;
++
++    LIST_FOR_EACH_ENTRY( view, &mapped_views, struct mapped_view, entry )
++        if ((const char *)addr >= (char *)view->mdl->MappedSystemVa &&
++            (const char *)addr < (char *)view->mdl->MappedSystemVa + view->mdl->ByteCount)
++            return view;
++    return NULL;
++}
++
++static void add_mapped_view( MDL *mdl )
++{
++    struct mapped_view *view;
++
++    if (!(mdl->MdlFlags & MDL_PAGES_LOCKED) || !(view = malloc( sizeof(*view) ))) return;
++    view->mdl = mdl;
++    view->pending_unmap = NULL;
++
++    EnterCriticalSection( &mapped_views_cs );
++    list_add_tail( &mapped_views, &view->entry );
++    LeaveCriticalSection( &mapped_views_cs );
++}
++
++static void remove_mapped_view( MDL *mdl )
++{
++    struct mapped_view *view, *other;
++    void *unmap = NULL;
++
++    EnterCriticalSection( &mapped_views_cs );
++    LIST_FOR_EACH_ENTRY( view, &mapped_views, struct mapped_view, entry )
++    {
++        if (view->mdl != mdl) continue;
++        unmap = view->pending_unmap;
++        list_remove( &view->entry );
++        free( view );
++        /* another MDL may still map the same view */
++        if (unmap && (other = find_mapped_view( unmap )))
++        {
++            other->pending_unmap = unmap;
++            unmap = NULL;
++        }
++        break;
++    }
++    LeaveCriticalSection( &mapped_views_cs );
++
++    if (unmap) NtUnmapViewOfSection( GetCurrentProcess(), unmap );
++}
++
++/***********************************************************************
++ *           ZwUnmapViewOfSection  (NTOSKRNL.EXE.@)
++ */
++NTSTATUS WINAPI ZwUnmapViewOfSection( HANDLE process, void *addr )
++{
++    /* surely upstreamable........... */
++    struct mapped_view *view = NULL;
++
++    TRACE( "process %p, addr %p\n", process, addr );
++
++    if (process == GetCurrentProcess())
++    {
++        EnterCriticalSection( &mapped_views_cs );
++        if ((view = find_mapped_view( addr ))) view->pending_unmap = addr;
++        LeaveCriticalSection( &mapped_views_cs );
++    }
++    if (view) return STATUS_SUCCESS;
++
++    return NtUnmapViewOfSection( process, addr );
++}
++
+ /***********************************************************************
+  *           IoAllocateMdl  (NTOSKRNL.EXE.@)
+  */
+@@ -1247,6 +1337,7 @@ PMDL WINAPI IoAllocateMdl( PVOID va, ULONG length, BOOLEAN secondary, BOOLEAN ch
+ void WINAPI IoFreeMdl(PMDL mdl)
+ {
+     TRACE("%p\n", mdl);
++    remove_mapped_view( mdl );
+     HeapFree(GetProcessHeap(), 0, mdl);
+ }
+ 
+@@ -1516,6 +1607,7 @@ static void free_driver_object( void *obj )
+     struct wine_driver *driver = obj;
+     RtlFreeUnicodeString( &driver->driver_obj.DriverName );
+     RtlFreeUnicodeString( &driver->driver_obj.DriverExtension->ServiceKeyName );
++    RtlFreeUnicodeString( &driver->registry_path );
+     free_kernel_object( driver );
+ }
+ 
+@@ -1537,6 +1629,7 @@ POBJECT_TYPE IoDriverObjectType = &driver_type;
+ NTSTATUS WINAPI IoCreateDriver( UNICODE_STRING *name, PDRIVER_INITIALIZE init )
+ {
+     struct wine_driver *driver;
++    const WCHAR *key_name;
+     NTSTATUS status;
+     unsigned int i;
+ 
+@@ -1555,7 +1648,10 @@ NTSTATUS WINAPI IoCreateDriver( UNICODE_STRING *name, PDRIVER_INITIALIZE init )
+     driver->driver_obj.DriverInit      = init;
+     driver->driver_obj.DriverExtension = &driver->driver_extension;
+     driver->driver_extension.DriverObject   = &driver->driver_obj;
+-    build_driver_keypath( driver->driver_obj.DriverName.Buffer, &driver->driver_extension.ServiceKeyName );
++    build_driver_keypath( driver->driver_obj.DriverName.Buffer, &driver->registry_path );
++    if ((key_name = wcsrchr( driver->registry_path.Buffer, '\\' ))) key_name++;
++    else key_name = driver->registry_path.Buffer;
++    RtlCreateUnicodeString( &driver->driver_extension.ServiceKeyName, key_name );
+     for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
+         driver->driver_obj.MajorFunction[i] = unhandled_irp;
+     list_init( &driver->root_pnp_devices );
+@@ -1565,7 +1661,7 @@ NTSTATUS WINAPI IoCreateDriver( UNICODE_STRING *name, PDRIVER_INITIALIZE init )
+         ERR( "failed to insert driver %s in tree\n", debugstr_us(name) );
+     LeaveCriticalSection( &drivers_cs );
+ 
+-    status = driver->driver_obj.DriverInit( &driver->driver_obj, &driver->driver_extension.ServiceKeyName );
++    status = driver->driver_obj.DriverInit( &driver->driver_obj, &driver->registry_path );
+     if (status)
+     {
+         IoDeleteDriver( &driver->driver_obj );
+@@ -2583,6 +2679,31 @@ ULONG WINAPI PsGetProcessSessionId( PEPROCESS process )
+     return process->session_id;
+ }
+ 
++/*********************************************************************
++ *           PsGetProcessExitStatus    (NTOSKRNL.@)
++ */
++NTSTATUS WINAPI PsGetProcessExitStatus( PEPROCESS process )
++{
++    NTSTATUS status = process->info.ExitStatus, ret = STATUS_SUCCESS;
++    PROCESS_BASIC_INFORMATION info;
++    HANDLE h;
++
++    /* The creation-time snapshot can be stale; refresh until exit,
++     * when the status becomes final. */
++    if (status == STATUS_PENDING
++        && !(ret = ObOpenObjectByPointer( process, OBJ_KERNEL_HANDLE, NULL, PROCESS_QUERY_LIMITED_INFORMATION,
++                                          NULL, KernelMode, &h )))
++    {
++        if (!(ret = NtQueryInformationProcess( h, ProcessBasicInformation, &info, sizeof(info), NULL )))
++            process->info.ExitStatus = status = info.ExitStatus;
++        NtClose( h );
++    }
++    if (ret) WARN( "Error querying process %p, status %#lx.\n", process, ret );
++
++    TRACE( "%p -> %#lx\n", process, status );
++    return status;
++}
++
+ /*********************************************************************
+  *           PsGetProcessCreateTimeQuadPart    (NTOSKRNL.@)
+  */
+@@ -2723,22 +2844,48 @@ HANDLE WINAPI PsGetThreadProcessId( PETHREAD thread )
+     return thread->kthread.id.UniqueProcess;
+ }
+ 
+-/*********************************************************************
+- *           PsGetContextThread    (NTOSKRNL.@)
+- */
+-NTSTATUS WINAPI PsGetContextThread(PETHREAD thread, CONTEXT *context)
++NTSTATUS WINAPI get_context_thread( PETHREAD thread, CONTEXT *context, KPROCESSOR_MODE mode )
+ {
+     NTSTATUS status;
+-    HANDLE handle, id = PsGetThreadId(thread);
++    HANDLE h;
+ 
+-    if (!(handle = OpenThread(THREAD_ALL_ACCESS, FALSE, HandleToUlong(id))))
+-        return STATUS_NOT_FOUND;
++    TRACE("%p %p %u\n", thread, context, mode);
++
++    if (mode == KernelMode)
++        return STATUS_UNSUCCESSFUL;
++
++    if ((status = ObOpenObjectByPointer(thread, 0, NULL, THREAD_ALL_ACCESS, NULL, KernelMode, &h)))
++    {
++        WARN("Error opening thread object, status %#lx.\n", status);
++        return status;
++    }
++
++    status = NtGetContextThread(h, context);
++    NtClose(h);
+ 
+-    status = NtGetContextThread(handle, context);
+-    NtClose(handle);
+     return status;
+ }
+ 
++/*********************************************************************
++ *           PsGetContextThread    (NTOSKRNL.@)
++ */
++#ifdef __x86_64__
++__ASM_GLOBAL_FUNC( PsGetContextThread,
++                   "subq $0x28,%rsp\n\t"
++                   __ASM_SEH(".seh_stackalloc 0x28\n\t")
++                   __ASM_SEH(".seh_endprologue\n\t")
++                   __ASM_CFI(".cfi_adjust_cfa_offset 0x28\n\t")
++                   "call " __ASM_NAME("get_context_thread") "\n\t"
++                   "addq $0x28,%rsp\n\t"
++                   __ASM_CFI(".cfi_adjust_cfa_offset -0x28\n\t")
++                   "ret" )
++#else
++NTSTATUS WINAPI PsGetContextThread( PETHREAD thread, CONTEXT *context, KPROCESSOR_MODE mode )
++{
++    return get_context_thread( thread, context, mode );
++}
++#endif
++
+ /***********************************************************************
+  *           KeInsertQueue   (NTOSKRNL.EXE.@)
+  */
+@@ -3026,7 +3173,10 @@ PMDL WINAPI MmAllocatePagesForMdl(PHYSICAL_ADDRESS lowaddress, PHYSICAL_ADDRESS
+  */
+ void WINAPI MmBuildMdlForNonPagedPool(MDL *mdl)
+ {
+-    FIXME("stub: %p\n", mdl);
++    TRACE("%p\n", mdl);
++
++    mdl->MdlFlags |= MDL_SOURCE_IS_NONPAGED_POOL;
++    mdl->MappedSystemVa = (char *)mdl->StartVa + mdl->ByteOffset;
+ }
+ 
+ /***********************************************************************
+@@ -3133,8 +3283,11 @@ PVOID WINAPI MmMapLockedPages( MDL *mdl, KPROCESSOR_MODE mode )
+ {
+     TRACE( "%p %u\n", mdl, mode );
+ 
++    if (mdl->MdlFlags & MDL_MAPPED_TO_SYSTEM_VA) return mdl->MappedSystemVa;
++
+     mdl->MdlFlags |= MDL_MAPPED_TO_SYSTEM_VA;
+     mdl->MappedSystemVa = (char *)mdl->StartVa + mdl->ByteOffset;
++    add_mapped_view( mdl );
+     return mdl->MappedSystemVa;
+ }
+ 
+@@ -3144,9 +3297,12 @@ PVOID WINAPI MmMapLockedPages( MDL *mdl, KPROCESSOR_MODE mode )
+ PVOID WINAPI  MmMapLockedPagesSpecifyCache(PMDLX MemoryDescriptorList, KPROCESSOR_MODE AccessMode, MEMORY_CACHING_TYPE CacheType,
+                                            PVOID BaseAddress, ULONG BugCheckOnFailure, MM_PAGE_PRIORITY Priority)
+ {
+-    FIXME("(%p, %u, %u, %p, %lu, %u): stub\n", MemoryDescriptorList, AccessMode, CacheType, BaseAddress, BugCheckOnFailure, Priority);
++    TRACE("(%p, %u, %u, %p, %lu, %u)\n", MemoryDescriptorList, AccessMode, CacheType,
++          BaseAddress, BugCheckOnFailure, Priority);
+ 
+-    return NULL;
++    if (BaseAddress) FIXME("requested base address %p ignored\n", BaseAddress);
++
++    return MmMapLockedPages( MemoryDescriptorList, AccessMode );
+ }
+ 
+ /***********************************************************************
+@@ -3154,7 +3310,10 @@ PVOID WINAPI  MmMapLockedPagesSpecifyCache(PMDLX MemoryDescriptorList, KPROCESSO
+  */
+ void WINAPI MmUnmapLockedPages( void *base, MDL *mdl )
+ {
+-    FIXME( "(%p %p_\n", base, mdl );
++    TRACE( "%p %p\n", base, mdl );
++
++    remove_mapped_view( mdl );
++    mdl->MdlFlags &= ~MDL_MAPPED_TO_SYSTEM_VA;
+ }
+ 
+ /***********************************************************************
+@@ -3180,7 +3339,9 @@ PVOID WINAPI MmPageEntireDriver(PVOID AddrInSection)
+  */
+ void WINAPI MmProbeAndLockPages(PMDLX MemoryDescriptorList, KPROCESSOR_MODE AccessMode, LOCK_OPERATION Operation)
+ {
+-    FIXME("(%p, %u, %u): stub\n", MemoryDescriptorList, AccessMode, Operation);
++    TRACE("(%p, %u, %u)\n", MemoryDescriptorList, AccessMode, Operation);
++
++    MemoryDescriptorList->MdlFlags |= MDL_PAGES_LOCKED;
+ }
+ 
+ 
+@@ -3198,7 +3359,9 @@ void WINAPI MmResetDriverPaging(PVOID AddrInSection)
+  */
+ void WINAPI  MmUnlockPages(PMDLX MemoryDescriptorList)
+ {
+-    FIXME("(%p): stub\n", MemoryDescriptorList);
++    TRACE("(%p)\n", MemoryDescriptorList);
++
++    MemoryDescriptorList->MdlFlags &= ~MDL_PAGES_LOCKED;
+ }
+ 
+ 
+@@ -4211,6 +4374,15 @@ static HMODULE load_driver( const WCHAR *driver_name, const UNICODE_STRING *keyn
+     return module;
+ }
+ 
++#if defined(__x86_64__) && !defined(__arm64ec__)
++static NTSTATUS __attribute__((naked)) call_driver_init( struct _DRIVER_OBJECT *driver, PUNICODE_STRING keyname, void *init )
++{
++    asm( "movq $0xFFFF800000000000,%r9\n\t"
++         "orq %r9,(%rsp)\n\t" 
++         "jmpq *%r8\n\t" );
++}
++#endif
++
+ /* call the driver init entry point */
+ static NTSTATUS WINAPI init_driver( DRIVER_OBJECT *driver_object, UNICODE_STRING *keyname )
+ {
+@@ -4232,6 +4404,15 @@ static NTSTATUS WINAPI init_driver( DRIVER_OBJECT *driver_object, UNICODE_STRING
+     driver_object->DriverStart = ((LDR_DATA_TABLE_ENTRY *)driver_object->DriverSection)->DllBase;
+     driver_object->DriverSize = ((LDR_DATA_TABLE_ENTRY *)driver_object->DriverSection)->SizeOfImage;
+ 
++    SERVER_START_REQ( register_kernel_module )
++    {
++        req->base = wine_server_client_ptr( driver_object->DriverStart );
++        req->size = driver_object->DriverSize;
++        wine_server_add_data( req, driver_name, wcslen( driver_name ) * sizeof(WCHAR) );
++        wine_server_call( req );
++    }
++    SERVER_END_REQ;
++
+     nt = RtlImageNtHeader( module );
+     if (!nt->OptionalHeader.AddressOfEntryPoint) return STATUS_SUCCESS;
+     driver_object->DriverInit = (PDRIVER_INITIALIZE)((char *)module + nt->OptionalHeader.AddressOfEntryPoint);
+@@ -4239,7 +4420,11 @@ static NTSTATUS WINAPI init_driver( DRIVER_OBJECT *driver_object, UNICODE_STRING
+     TRACE_(relay)( "\1Call driver init %p (obj=%p,str=%s)\n",
+                    driver_object->DriverInit, driver_object, wine_dbgstr_w(keyname->Buffer) );
+ 
++#if defined(__x86_64__) && !defined(__arm64ec__)
++    status = call_driver_init( driver_object, keyname, driver_object->DriverInit );
++#else
+     status = driver_object->DriverInit( driver_object, keyname );
++#endif
+ 
+     TRACE_(relay)( "\1Ret  driver init %p (obj=%p,str=%s) retval=%08lx\n",
+                    driver_object->DriverInit, driver_object, wine_dbgstr_w(keyname->Buffer), status );
+@@ -4534,6 +4719,18 @@ PVOID WINAPI PsGetProcessWow64Process(PEPROCESS process)
+     return NULL;
+ }
+ 
++/*********************************************************************
++ *           MmCopyMemory    (NTOSKRNL.@)
++ */
++NTSTATUS WINAPI MmCopyMemory(void *target, MM_COPY_ADDRESS source, SIZE_T size, ULONG flags, SIZE_T *copied)
++{
++    FIXME("target %p, source %s, size %Iu, flags %#lx, copied %p stub.\n",
++            target, wine_dbgstr_longlong(source.PhysicalAddress.QuadPart), size, flags, copied);
++
++    *copied = 0;
++    return STATUS_NOT_IMPLEMENTED;
++}
++
+ /*********************************************************************
+  *           MmCopyVirtualMemory    (NTOSKRNL.@)
+  */
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+index 955750ba..dc38d214 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
++++ b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+@@ -715,6 +715,7 @@
+ @ stdcall MmBuildMdlForNonPagedPool(ptr)
+ @ stub MmCanFileBeTruncated
+ @ stub MmCommitSessionMappedView
++@ stdcall MmCopyMemory(ptr int64 long long ptr)
+ @ stdcall MmCopyVirtualMemory(ptr ptr ptr ptr long long ptr)
+ @ stub MmCreateMdl
+ @ stdcall MmCreateSection(ptr long ptr ptr long long long ptr)
+@@ -909,7 +910,7 @@
+ @ stub PsDereferencePrimaryToken
+ @ stub PsDisableImpersonation
+ @ stub PsEstablishWin32Callouts
+-@ stdcall PsGetContextThread(ptr ptr)
++@ stdcall PsGetContextThread(ptr ptr long)
+ @ stdcall PsGetCurrentProcess() IoGetCurrentProcess
+ @ stdcall PsGetCurrentProcessId()
+ @ stdcall PsGetCurrentProcessSessionId()
+@@ -924,7 +925,7 @@
+ @ stdcall PsGetProcessCreateTimeQuadPart(ptr)
+ @ stub PsGetProcessDebugPort
+ @ stub PsGetProcessExitProcessCalled
+-@ stub PsGetProcessExitStatus
++@ stdcall PsGetProcessExitStatus(ptr)
+ @ stub PsGetProcessExitTime
+ @ stdcall PsGetProcessId(ptr)
+ @ stdcall PsGetProcessImageFileName(ptr)
+@@ -1549,7 +1550,7 @@
+ @ stdcall -private ZwUnloadKey(ptr) NtUnloadKey
+ @ stdcall -private ZwUnlockFile(long ptr ptr ptr ptr) NtUnlockFile
+ @ stdcall -private ZwUnlockVirtualMemory(long ptr ptr long) NtUnlockVirtualMemory
+-@ stdcall ZwUnmapViewOfSection(long ptr) NtUnmapViewOfSection
++@ stdcall ZwUnmapViewOfSection(long ptr)
+ @ stdcall -private ZwWaitForMultipleObjects(long ptr long long ptr) NtWaitForMultipleObjects
+ @ stdcall ZwWaitForSingleObject(long long ptr) NtWaitForSingleObject
+ @ stdcall ZwWriteFile(long long ptr ptr ptr ptr long ptr ptr) NtWriteFile
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl_private.h b/dlls/ntoskrnl.exe/ntoskrnl_private.h
+index 57ce7991..a23c04b0 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl_private.h
++++ b/dlls/ntoskrnl.exe/ntoskrnl_private.h
+@@ -105,6 +105,7 @@ struct wine_driver
+ {
+     DRIVER_OBJECT driver_obj;
+     DRIVER_EXTENSION driver_extension;
++    UNICODE_STRING registry_path;
+     SERVICE_STATUS_HANDLE service_handle;
+     struct wine_rb_entry entry;
+     struct list root_pnp_devices;
+diff --git a/include/ddk/wdm.h b/include/ddk/wdm.h
+index 9bbba22d..8e093c92 100644
+--- a/include/ddk/wdm.h
++++ b/include/ddk/wdm.h
+@@ -802,6 +802,16 @@ typedef enum _INTERFACE_TYPE {
+ 
+ typedef LARGE_INTEGER PHYSICAL_ADDRESS, *PPHYSICAL_ADDRESS;
+ 
++#define MM_COPY_MEMORY_PHYSICAL           0x1
++#define MM_COPY_MEMORY_VIRTUAL            0x2
++
++typedef struct _MM_COPY_ADDRESS {
++  union {
++    PVOID            VirtualAddress;
++    PHYSICAL_ADDRESS PhysicalAddress;
++  } DUMMYUNIONNAME;
++} MM_COPY_ADDRESS, *PMM_COPY_ADDRESS;
++
+ #define IO_RESOURCE_PREFERRED             0x01
+ #define IO_RESOURCE_DEFAULT               0x02
+ #define IO_RESOURCE_ALTERNATIVE           0x08
+@@ -1873,6 +1883,7 @@ void      WINAPI MmFreeNonCachedMemory(PVOID,SIZE_T);
+ PVOID     WINAPI MmAllocateNonCachedMemory(SIZE_T) __WINE_ALLOC_SIZE(1) __WINE_DEALLOC(MmFreeNonCachedMemory) __WINE_MALLOC;
+ PMDL      WINAPI MmAllocatePagesForMdl(PHYSICAL_ADDRESS,PHYSICAL_ADDRESS,PHYSICAL_ADDRESS,SIZE_T);
+ void      WINAPI MmBuildMdlForNonPagedPool(MDL*);
++NTSTATUS  WINAPI MmCopyMemory(void*,MM_COPY_ADDRESS,SIZE_T,ULONG,SIZE_T*);
+ NTSTATUS  WINAPI MmCopyVirtualMemory(PEPROCESS,void*,PEPROCESS,void*,SIZE_T,KPROCESSOR_MODE,SIZE_T*);
+ void *    WINAPI MmGetSystemRoutineAddress(UNICODE_STRING*);
+ PVOID     WINAPI MmMapLockedPages(MDL*,KPROCESSOR_MODE);
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index 61686682..10342263 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -373,6 +373,14 @@ struct luid_attr
+     unsigned int attrs;
+ };
+ 
++struct kernel_module_info
++{
++    client_ptr_t base;
++    mem_size_t   size;
++    data_size_t  name_len;
++
++};
++
+ struct acl
+ {
+     unsigned char  revision;
+@@ -5356,6 +5364,8 @@ struct set_kernel_object_ptr_reply
+ 
+ 
+ 
++
++
+ struct grab_kernel_object_request
+ {
+     struct request_header __header;
+@@ -5425,6 +5435,8 @@ struct grant_process_admin_token_reply
+ 
+ 
+ 
++
++
+ struct get_token_info_request
+ {
+     struct request_header __header;
+@@ -6161,6 +6173,60 @@ struct d3dkmt_mutex_release_reply
+ };
+ 
+ 
++
++struct register_kernel_module_request
++{
++    struct request_header __header;
++    char __pad_12[4];
++    client_ptr_t base;
++    mem_size_t   size;
++    /* VARARG(name,unicode_str); */
++};
++struct register_kernel_module_reply
++{
++    struct reply_header __header;
++};
++
++
++struct unregister_kernel_module_request
++{
++    struct request_header __header;
++    char __pad_12[4];
++    client_ptr_t base;
++};
++struct unregister_kernel_module_reply
++{
++    struct reply_header __header;
++};
++
++
++struct list_kernel_modules_request
++{
++    struct request_header __header;
++    char __pad_12[4];
++};
++struct list_kernel_modules_reply
++{
++    struct reply_header __header;
++    unsigned int module_count;
++    data_size_t  info_size;
++    /* VARARG(info,kernel_module_info); */
++};
++
++
++struct set_process_session_request
++{
++    struct request_header __header;
++    obj_handle_t handle;
++    unsigned int session_id;
++    char __pad_20[4];
++};
++struct set_process_session_reply
++{
++    struct reply_header __header;
++};
++
++
+ enum request
+ {
+     REQ_new_process,
+@@ -6469,6 +6535,10 @@ enum request
+     REQ_d3dkmt_object_open_name,
+     REQ_d3dkmt_mutex_acquire,
+     REQ_d3dkmt_mutex_release,
++    REQ_register_kernel_module,
++    REQ_unregister_kernel_module,
++    REQ_list_kernel_modules,
++    REQ_set_process_session,
+     REQ_NB_REQUESTS
+ };
+ 
+@@ -6782,6 +6852,10 @@ union generic_request
+     struct d3dkmt_object_open_name_request d3dkmt_object_open_name_request;
+     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
+     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
++    struct register_kernel_module_request register_kernel_module_request;
++    struct unregister_kernel_module_request unregister_kernel_module_request;
++    struct list_kernel_modules_request list_kernel_modules_request;
++    struct set_process_session_request set_process_session_request;
+ };
+ union generic_reply
+ {
+@@ -7093,8 +7167,12 @@ union generic_reply
+     struct d3dkmt_object_open_name_reply d3dkmt_object_open_name_reply;
+     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
+     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
++    struct register_kernel_module_reply register_kernel_module_reply;
++    struct unregister_kernel_module_reply unregister_kernel_module_reply;
++    struct list_kernel_modules_reply list_kernel_modules_reply;
++    struct set_process_session_reply set_process_session_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 1809
++#define SERVER_PROTOCOL_VERSION 1811
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/include/winternl.h b/include/winternl.h
+index 80c295f0..b53a8ef4 100644
+--- a/include/winternl.h
++++ b/include/winternl.h
+@@ -2015,6 +2015,7 @@ typedef enum _PROCESSINFOCLASS {
+ #ifdef __WINESRC__
+     ProcessWineMakeProcessSystem = 1000,
+     ProcessWineGrantAdminToken = 1002,
++    ProcessWineSessionId = 1003,
+ #endif
+ } PROCESSINFOCLASS;
+ 
+diff --git a/loader/wine.inf.in b/loader/wine.inf.in
+index 942a2cf1..e976075c 100644
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -769,6 +769,8 @@ HKLM,SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x86,"Version",2,"14.42.344
+ 11,,presentationfontcache.exe,-
+ ; some programs are 64-bit only
+ 11,,conhost.exe,-
++11,,csrss.exe,-
++11,,lsass.exe,-
+ 11,,plugplay.exe,-
+ 11,,rpcss.exe,-
+ 11,,services.exe,-
+diff --git a/loader/wine_info.plist.in b/loader/wine_info.plist.in
+index beb1c33b..9751f75e 100644
+--- a/loader/wine_info.plist.in
++++ b/loader/wine_info.plist.in
+@@ -26,5 +26,7 @@
+     <string>WineApplication</string>
+     <key>LSUIElement</key>
+     <string>1</string>
++    <key>NSPrefersDisplaySafeAreaCompatibilityMode</key>
++    <true/>
+ </dict>
+ </plist>
+diff --git a/programs/csrss/Makefile.in b/programs/csrss/Makefile.in
+new file mode 100644
+index 00000000..35344219
+--- /dev/null
++++ b/programs/csrss/Makefile.in
+@@ -0,0 +1,6 @@
++MODULE    = csrss.exe
++
++EXTRADLLFLAGS = -mwindows
++
++SOURCES = \
++	main.c
+diff --git a/programs/csrss/main.c b/programs/csrss/main.c
+new file mode 100644
+index 00000000..0ddffda2
+--- /dev/null
++++ b/programs/csrss/main.c
+@@ -0,0 +1,32 @@
++/*
++ * csrss.exe
++ *
++ * Copyright 2026 bluechxin
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <windows.h>
++#include <winternl.h>
++
++int __cdecl main( int argc, char *argv[] )
++{
++    HANDLE exit_event = NULL;
++
++    NtSetInformationProcess( GetCurrentProcess(), ProcessWineMakeProcessSystem,
++                             &exit_event, sizeof(HANDLE *) );
++    if (exit_event) WaitForSingleObject( exit_event, INFINITE );
++    return 0;
++}
+diff --git a/programs/lsass/Makefile.in b/programs/lsass/Makefile.in
+new file mode 100644
+index 00000000..28ac021b
+--- /dev/null
++++ b/programs/lsass/Makefile.in
+@@ -0,0 +1,6 @@
++MODULE    = lsass.exe
++
++EXTRADLLFLAGS = -mwindows
++
++SOURCES = \
++	main.c
+diff --git a/programs/lsass/main.c b/programs/lsass/main.c
+new file mode 100644
+index 00000000..4fc73319
+--- /dev/null
++++ b/programs/lsass/main.c
+@@ -0,0 +1,35 @@
++/*
++ * lsass.exe
++ *
++ * Copyright 2026 bluechxin
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <windows.h>
++#include <winternl.h>
++
++int __cdecl main( int argc, char *argv[] )
++{
++    ULONG session_id = 0;
++    HANDLE exit_event = NULL;
++
++    NtSetInformationProcess( GetCurrentProcess(), ProcessWineSessionId,
++                             &session_id, sizeof(session_id) );
++    NtSetInformationProcess( GetCurrentProcess(), ProcessWineMakeProcessSystem,
++                             &exit_event, sizeof(HANDLE *) );
++    if (exit_event) WaitForSingleObject( exit_event, INFINITE );
++    return 0;
++}
+diff --git a/programs/wineboot/wineboot.c b/programs/wineboot/wineboot.c
+index 5e702a5c..39c7a66d 100644
+--- a/programs/wineboot/wineboot.c
++++ b/programs/wineboot/wineboot.c
+@@ -1424,6 +1424,23 @@ static int ProcessWindowsFileProtection(void)
+     return 1;
+ }
+ 
++/* start one of the stub system processes; they exit by themselves once the
++ * last ordinary process is gone, so nothing waits for them here */
++static void start_stub_process(const WCHAR *path)
++{
++    PROCESS_INFORMATION pi;
++    STARTUPINFOW si = { sizeof(si) };
++
++    if (!CreateProcessW(path, NULL, NULL, NULL, FALSE, DETACHED_PROCESS, NULL, NULL, &si, &pi))
++    {
++        WINE_ERR("Couldn't start %s: error %lu\n", wine_dbgstr_w(path), GetLastError());
++        return;
++    }
++    CloseHandle(pi.hThread);
++    CloseHandle(pi.hProcess);
++}
++
++
+ static BOOL start_services_process(void)
+ {
+     static const WCHAR svcctl_started_event[] = SVCCTL_STARTED_EVENT;
+@@ -1960,6 +1977,8 @@ int __cdecl main( int argc, char *argv[] )
+     {
+         ProcessRunKeys( HKEY_LOCAL_MACHINE, L"RunServices", FALSE, FALSE );
+         start_services_process();
++        start_stub_process( L"C:\\windows\\system32\\csrss.exe" );
++        start_stub_process( L"C:\\windows\\system32\\lsass.exe" );
+     }
+ 
+     if (init || update) update_wineprefix( update );
+diff --git a/server/device.c b/server/device.c
+index 3eed7434..cfe85599 100644
+--- a/server/device.c
++++ b/server/device.c
+@@ -39,6 +39,20 @@
+ #include "request.h"
+ #include "process.h"
+ 
++/* loaded kernel module */
++
++struct kernel_module
++{
++    struct list      entry;      /* entry in kernel_modules list */
++    struct process  *owner;      /* process that registered it, not a reference */
++    client_ptr_t     base;       /* module base address in the owner process */
++    mem_size_t       size;       /* module size */
++    WCHAR           *name;       /* module name */
++    data_size_t      name_len;   /* length of name in bytes */
++};
++
++static struct list kernel_modules = LIST_INIT(kernel_modules);
++
+ /* IRP object */
+ 
+ struct irp_call
+@@ -888,6 +902,22 @@ void free_kernel_objects( struct object *obj )
+ }
+ 
+ 
++/* remove the modules of a process that is going away, a winedevice may
++ * die without unloading its drivers */
++void free_kernel_modules( struct process *process )
++{
++    struct kernel_module *module, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( module, next, &kernel_modules, struct kernel_module, entry )
++    {
++        if (module->owner != process) continue;
++        list_remove( &module->entry );
++        free( module->name );
++        free( module );
++    }
++}
++
++
+ /* create a device manager */
+ DECL_HANDLER(create_device_manager)
+ {
+@@ -1169,3 +1199,83 @@ DECL_HANDLER(get_kernel_object_handle)
+ 
+     release_object( manager );
+ }
++
++
++/* register a newly loaded kernel module */
++DECL_HANDLER(register_kernel_module)
++{
++    struct kernel_module *module;
++
++    if (!(module = mem_alloc( sizeof(*module) ))) return;
++
++    module->name_len = get_req_data_size();
++    module->name = NULL;
++
++    if (module->name_len && !(module->name = memdup( get_req_data(), module->name_len )))
++    {
++        free( module );
++        return;
++    }
++
++    module->owner = current->process;
++    module->base = req->base;
++    module->size = req->size;
++    list_add_tail( &kernel_modules, &module->entry );
++}
++
++
++/* unregister a kernel module that is being unloaded */
++DECL_HANDLER(unregister_kernel_module)
++{
++    struct kernel_module *module;
++
++    /* a module is identified by its base address within its owner process */
++    LIST_FOR_EACH_ENTRY( module, &kernel_modules, struct kernel_module, entry )
++    {
++        if (module->base == req->base && module->owner == current->process)
++        {
++            list_remove( &module->entry );
++            free( module->name );
++            free( module );
++            return;
++        }
++    }
++}
++
++
++/* return the list of currently loaded kernel modules */
++DECL_HANDLER(list_kernel_modules)
++{
++    struct kernel_module *module;
++    char *data;
++
++    LIST_FOR_EACH_ENTRY( module, &kernel_modules, struct kernel_module, entry )
++    {
++        reply->module_count++;
++        reply->info_size += (sizeof(struct kernel_module_info) + module->name_len
++                             + sizeof(client_ptr_t)-1) / sizeof(client_ptr_t) * sizeof(client_ptr_t);
++    }
++
++    if (reply->info_size > get_reply_max_size())
++    {
++        set_error( STATUS_INFO_LENGTH_MISMATCH );
++        return;
++    }
++
++    if (!(data = set_reply_data_size( reply->info_size ))) return;
++
++    memset( data, 0, reply->info_size );
++
++    LIST_FOR_EACH_ENTRY( module, &kernel_modules, struct kernel_module, entry )
++    {
++        struct kernel_module_info *info = (struct kernel_module_info *)data;
++
++        info->base     = module->base;
++        info->size     = module->size;
++        info->name_len = module->name_len;
++        memcpy( info + 1, module->name, module->name_len );
++        data += (sizeof(*info) + module->name_len
++                 + sizeof(client_ptr_t)-1) / sizeof(client_ptr_t) * sizeof(client_ptr_t);
++    }
++}
++
+diff --git a/server/object.h b/server/object.h
+index 104113a3..013d91ef 100644
+--- a/server/object.h
++++ b/server/object.h
+@@ -161,6 +161,8 @@ extern void *open_named_object( struct object *parent, const struct object_ops *
+ extern void unlink_named_object( struct object *obj );
+ extern struct namespace *create_namespace( unsigned int hash_size );
+ extern void free_kernel_objects( struct object *obj );
++extern void free_kernel_modules( struct process *process );
++extern void unregister_process_kernel_modules( struct process *process );
+ /* grab/release_object can take any pointer, but you better make sure */
+ /* that the thing pointed to starts with a struct object... */
+ extern struct object *grab_object( void *obj );
+diff --git a/server/process.c b/server/process.c
+index edc57b1a..8b5cd5fe 100644
+--- a/server/process.c
++++ b/server/process.c
+@@ -941,6 +941,7 @@ static void process_destroy( struct object *obj )
+ 
+     close_process_handles( process );
+     set_process_startup_state( process, STARTUP_ABORTED );
++    free_kernel_modules( process );
+ 
+     if (process->job)
+     {
+@@ -2025,6 +2026,24 @@ DECL_HANDLER(grant_process_admin_token)
+     release_object( process );
+ }
+ 
++/* move a process to a different terminal services session */
++DECL_HANDLER(set_process_session)
++{
++    struct process *process;
++
++    if (!(process = get_process_from_handle( req->handle, PROCESS_SET_INFORMATION )))
++        return;
++
++    if (process->token)
++    {
++        token_set_session_id( process->token, req->session_id );
++        process->session_id = req->session_id;
++    }
++    else set_error( STATUS_NO_TOKEN );
++
++    release_object( process );
++}
++
+ /* create a new job object */
+ DECL_HANDLER(create_job)
+ {
+diff --git a/server/protocol.def b/server/protocol.def
+index a405cb9d..319df055 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -389,6 +389,14 @@ struct luid_attr
+     unsigned int attrs;
+ };
+ 
++struct kernel_module_info
++{
++    client_ptr_t base;
++    mem_size_t   size;
++    data_size_t  name_len;
++    /* VARARG(name,unicode_str,name_len); */
++};
++
+ struct acl
+ {
+     unsigned char  revision;
+@@ -3789,6 +3797,8 @@ struct handle_info
+ @END
+ 
+ 
++
++
+ /* Grab server object reference from kernel object pointer */
+ @REQ(grab_kernel_object)
+     obj_handle_t manager;         /* handle to the device manager */
+@@ -3827,6 +3837,8 @@ struct handle_info
+ @END
+ 
+ 
++
++
+ /* Get detailed fixed-size information about a token */
+ @REQ(get_token_info)
+     obj_handle_t   handle;        /* handle to the object */
+@@ -4272,3 +4284,30 @@ enum inproc_sync_type
+     data_size_t         runtime_size;   /* size of client runtime data */
+     VARARG(runtime,bytes);              /* client runtime data */
+ @END
++
++/* CrossOver port: append new requests to preserve existing request IDs. */
++/* Register a loaded kernel module */
++@REQ(register_kernel_module)
++    client_ptr_t base;            /* module base address */
++    mem_size_t   size;            /* module size */
++    VARARG(name,unicode_str);     /* module name */
++@END
++
++/* Unregister a kernel module */
++@REQ(unregister_kernel_module)
++    client_ptr_t base;            /* module base address */
++@END
++
++/* Return the list of loaded kernel modules */
++@REQ(list_kernel_modules)
++@REPLY
++    unsigned int module_count;    /* number of modules */
++    data_size_t  info_size;       /* total size of module info */
++    VARARG(info,kernel_module_info); /* module info */
++@END
++
++/* Move a process to a different terminal services session */
++@REQ(set_process_session)
++    obj_handle_t handle;          /* handle to the process */
++    unsigned int session_id;      /* new session id */
++@END
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index 3a2bbb15..98b8f11d 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -313,6 +313,10 @@ DECL_HANDLER(d3dkmt_share_objects);
+ DECL_HANDLER(d3dkmt_object_open_name);
+ DECL_HANDLER(d3dkmt_mutex_acquire);
+ DECL_HANDLER(d3dkmt_mutex_release);
++DECL_HANDLER(register_kernel_module);
++DECL_HANDLER(unregister_kernel_module);
++DECL_HANDLER(list_kernel_modules);
++DECL_HANDLER(set_process_session);
+ 
+ typedef void (*req_handler)( const void *req, void *reply );
+ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+@@ -623,6 +627,10 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_d3dkmt_object_open_name,
+     (req_handler)req_d3dkmt_mutex_acquire,
+     (req_handler)req_d3dkmt_mutex_release,
++    (req_handler)req_register_kernel_module,
++    (req_handler)req_unregister_kernel_module,
++    (req_handler)req_list_kernel_modules,
++    (req_handler)req_set_process_session,
+ };
+ 
+ C_ASSERT( sizeof(abstime_t) == 8 );
+@@ -2374,3 +2382,15 @@ C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, key_value) == 20 );
+ C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, fence_value) == 24 );
+ C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, runtime_size) == 32 );
+ C_ASSERT( sizeof(struct d3dkmt_mutex_release_request) == 40 );
++C_ASSERT( offsetof(struct register_kernel_module_request, base) == 16 );
++C_ASSERT( offsetof(struct register_kernel_module_request, size) == 24 );
++C_ASSERT( sizeof(struct register_kernel_module_request) == 32 );
++C_ASSERT( offsetof(struct unregister_kernel_module_request, base) == 16 );
++C_ASSERT( sizeof(struct unregister_kernel_module_request) == 24 );
++C_ASSERT( sizeof(struct list_kernel_modules_request) == 16 );
++C_ASSERT( offsetof(struct list_kernel_modules_reply, module_count) == 8 );
++C_ASSERT( offsetof(struct list_kernel_modules_reply, info_size) == 12 );
++C_ASSERT( sizeof(struct list_kernel_modules_reply) == 16 );
++C_ASSERT( offsetof(struct set_process_session_request, handle) == 12 );
++C_ASSERT( offsetof(struct set_process_session_request, session_id) == 16 );
++C_ASSERT( sizeof(struct set_process_session_request) == 24 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index c635ebeb..8339d1ec 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -28,6 +28,7 @@ static void dump_varargs_directory_entries( const char *prefix, data_size_t size
+ static void dump_varargs_filesystem_event( const char *prefix, data_size_t size );
+ static void dump_varargs_handle_infos( const char *prefix, data_size_t size );
+ static void dump_varargs_ints( const char *prefix, data_size_t size );
++static void dump_varargs_kernel_module_info( const char *prefix, data_size_t size );
+ static void dump_varargs_luid_attr( const char *prefix, data_size_t size );
+ static void dump_varargs_message_data( const char *prefix, data_size_t size );
+ static void dump_varargs_monitor_infos( const char *prefix, data_size_t size );
+@@ -3509,6 +3510,35 @@ static void dump_d3dkmt_mutex_release_request( const struct d3dkmt_mutex_release
+     dump_varargs_bytes( ", runtime=", cur_size );
+ }
+ 
++static void dump_register_kernel_module_request( const struct register_kernel_module_request *req )
++{
++    dump_uint64( " base=", &req->base );
++    dump_uint64( ", size=", &req->size );
++    dump_varargs_unicode_str( ", name=", cur_size );
++}
++
++static void dump_unregister_kernel_module_request( const struct unregister_kernel_module_request *req )
++{
++    dump_uint64( " base=", &req->base );
++}
++
++static void dump_list_kernel_modules_request( const struct list_kernel_modules_request *req )
++{
++}
++
++static void dump_list_kernel_modules_reply( const struct list_kernel_modules_reply *req )
++{
++    fprintf( stderr, " module_count=%08x", req->module_count );
++    fprintf( stderr, ", info_size=%u", req->info_size );
++    dump_varargs_kernel_module_info( ", info=", cur_size );
++}
++
++static void dump_set_process_session_request( const struct set_process_session_request *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", session_id=%08x", req->session_id );
++}
++
+ typedef void (*dump_func)( const void *req );
+ 
+ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+@@ -3819,6 +3849,10 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_d3dkmt_object_open_name_request,
+     (dump_func)dump_d3dkmt_mutex_acquire_request,
+     (dump_func)dump_d3dkmt_mutex_release_request,
++    (dump_func)dump_register_kernel_module_request,
++    (dump_func)dump_unregister_kernel_module_request,
++    (dump_func)dump_list_kernel_modules_request,
++    (dump_func)dump_set_process_session_request,
+ };
+ 
+ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+@@ -4129,6 +4163,10 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_d3dkmt_object_open_name_reply,
+     (dump_func)dump_d3dkmt_mutex_acquire_reply,
+     NULL,
++    NULL,
++    NULL,
++    (dump_func)dump_list_kernel_modules_reply,
++    NULL,
+ };
+ 
+ static const char * const req_names[REQ_NB_REQUESTS] =
+@@ -4439,6 +4477,10 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "d3dkmt_object_open_name",
+     "d3dkmt_mutex_acquire",
+     "d3dkmt_mutex_release",
++    "register_kernel_module",
++    "unregister_kernel_module",
++    "list_kernel_modules",
++    "set_process_session",
+ };
+ 
+ static const struct
+diff --git a/server/security.h b/server/security.h
+index f4dff679..ed31b2e3 100644
+--- a/server/security.h
++++ b/server/security.h
+@@ -75,6 +75,7 @@ extern const struct acl *token_get_default_dacl( struct token *token );
+ extern const struct sid *token_get_owner( struct token *token );
+ extern const struct sid *token_get_primary_group( struct token *token );
+ extern unsigned int token_get_session_id( struct token *token );
++extern void token_set_session_id( struct token *token, unsigned int session_id );
+ extern int token_sid_present( struct token *token, const struct sid *sid, int deny );
+ 
+ static inline struct ace *ace_first( const struct acl *acl )
+diff --git a/server/token.c b/server/token.c
+index 5ce72982..dcc5699e 100644
+--- a/server/token.c
++++ b/server/token.c
+@@ -1084,6 +1084,11 @@ unsigned int token_get_session_id( struct token *token )
+     return token->session_id;
+ }
+ 
++void token_set_session_id( struct token *token, unsigned int session_id )
++{
++    token->session_id = session_id;
++}
++
+ int check_object_access(struct token *token, struct object *obj, unsigned int *access)
+ {
+     struct generic_map mapping;
+diff --git a/server/trace.c b/server/trace.c
+index 8f0f622f..a364ddbc 100644
+--- a/server/trace.c
++++ b/server/trace.c
+@@ -1558,6 +1558,33 @@ static void dump_varargs_monitor_infos( const char *prefix, data_size_t size )
+     remove_data( size );
+ }
+ 
++static void dump_varargs_kernel_module_info( const char *prefix, data_size_t size )
++{
++    fprintf( stderr,"%s{", prefix );
++    while (size)
++    {
++        const struct kernel_module_info *info = cur_data;
++        data_size_t len;
++
++        if (size < sizeof(*info)) break;
++        len = (sizeof(*info) + info->name_len + sizeof(client_ptr_t)-1)
++               / sizeof(client_ptr_t) * sizeof(client_ptr_t);
++        if (size < len) break;
++
++        dump_uint64( "{base=", &info->base );
++        dump_uint64( ",size=", &info->size );
++        fprintf( stderr, ",name=L\"" );
++
++        dump_strW( (const WCHAR *)(info + 1), info->name_len, stderr, "\"\"" );
++        fprintf( stderr, "\"}" );
++
++        size -= len;
++        remove_data( len );
++        if (size)fputc( ',', stderr );
++    }
++    fputc( '}', stderr );
++}
++
+ void trace_request(void)
+ {
+     enum request req = current->req.request_header.req;

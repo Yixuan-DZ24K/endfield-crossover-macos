@@ -1,0 +1,22 @@
+name: macOS source checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  source-checks:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check publication contents
+        run: python3 scripts/check-publication.py
+      - name: Build standalone x86_64 libraries
+        run: ./scripts/build.sh
+      - name: Run geometry and offscreen AppKit tests
+        run: ./scripts/test.sh
+      - name: Check source whitespace
+        run: git diff --check

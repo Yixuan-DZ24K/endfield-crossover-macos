@@ -1,0 +1,5 @@
+* text=auto eol=lf
+# Context markers in preserved unified diffs can intentionally contain spaces.
+*.patch -whitespace
+# Preserve verbatim upstream license text, including its original whitespace.
+/LICENSES/LGPL-2.1-or-later.txt -whitespace

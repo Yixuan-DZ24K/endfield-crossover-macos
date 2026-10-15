@@ -1,0 +1,212 @@
+diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
+index 227d68b9..84cba62b 100644
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -23,6 +23,7 @@
+ #import "cocoa_event.h"
+ #import "cocoa_window.h"
+ #import "cocoa_icon_utils.h"
++#import "endfield_coords.h"
+ 
+ #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+ 
+@@ -129,6 +130,8 @@ - (void) handleApplicationShouldTerminateReply:(BOOL)reply;  /* CW Hack 22310 */
+ 
+ @implementation WineApplicationController
+ 
++    - (NSUInteger) efNotchCoordinateBridgeVersion { return 1; }
++
+     @synthesize keyboardType, lastFlagsChanged;
+     @synthesize displaysTemporarilyUncapturedForDialog, temporarilyIgnoreResignEventsForDialog;
+     @synthesize applicationIcon;
+@@ -1543,7 +1546,7 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+             {
+                 if (self.clippingCursor)
+                     [clipCursorHandler clipCursorLocation:&point];
+-                point = cgpoint_win_from_mac(point);
++                point = cgpoint_win_from_mac(ef_notch_logical_point(targetWindow, point));
+ 
+                 event = macdrv_create_event(MOUSE_MOVED_ABSOLUTE, targetWindow);
+                 event->mouse_moved.x = floor(point.x);
+@@ -1555,6 +1558,7 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+             else
+             {
+                 double scale = retina_on ? 2 : 1;
++                CGPoint affineScale = ef_notch_delta_scale(targetWindow);
+ 
+                 /* Add event delta to accumulated delta error */
+                 /* deltaY is already flipped */
+@@ -1562,12 +1566,12 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+                 mouseMoveDeltaY += [anEvent deltaY];
+ 
+                 event = macdrv_create_event(MOUSE_MOVED_RELATIVE, targetWindow);
+-                event->mouse_moved.x = mouseMoveDeltaX * scale;
+-                event->mouse_moved.y = mouseMoveDeltaY * scale;
++                event->mouse_moved.x = mouseMoveDeltaX * scale * affineScale.x;
++                event->mouse_moved.y = mouseMoveDeltaY * scale * affineScale.y;
+ 
+                 /* Keep the remainder after integer truncation. */
+-                mouseMoveDeltaX -= event->mouse_moved.x / scale;
+-                mouseMoveDeltaY -= event->mouse_moved.y / scale;
++                mouseMoveDeltaX -= event->mouse_moved.x / (scale * affineScale.x);
++                mouseMoveDeltaY -= event->mouse_moved.y / (scale * affineScale.y);
+             }
+ 
+             if (event->type == MOUSE_MOVED_ABSOLUTE || event->mouse_moved.x || event->mouse_moved.y)
+@@ -1688,7 +1692,7 @@ - (void) handleMouseButton:(NSEvent*)theEvent
+             {
+                 macdrv_event* event;
+ 
+-                pt = cgpoint_win_from_mac(pt);
++                pt = cgpoint_win_from_mac(ef_notch_logical_point(window, pt));
+ 
+                 event = macdrv_create_event(MOUSE_BUTTON, window);
+                 event->mouse_button.button = [theEvent buttonNumber];
+@@ -1771,7 +1775,7 @@ - (void) handleScrollWheel:(NSEvent*)theEvent
+                 double x, y;
+                 BOOL continuous = FALSE;
+ 
+-                pt = cgpoint_win_from_mac(pt);
++                pt = cgpoint_win_from_mac(ef_notch_logical_point(window, pt));
+ 
+                 event = macdrv_create_event(MOUSE_SCROLL, window);
+                 event->mouse_scroll.x = floor(pt.x);
+@@ -2804,7 +2808,7 @@ int macdrv_get_cursor_position(CGPoint *pos)
+     OnMainThread(^{
+         NSPoint location = [NSEvent mouseLocation];
+         location = [[WineApplicationController sharedController] flippedMouseLocation:location];
+-        *pos = cgpoint_win_from_mac(NSPointToCGPoint(location));
++        *pos = cgpoint_win_from_mac(ef_notch_logical_point([NSApp keyWindow], NSPointToCGPoint(location)));
+     });
+ 
+     return TRUE;
+@@ -2821,7 +2825,7 @@ int macdrv_set_cursor_position(CGPoint pos)
+     __block int ret;
+ 
+     OnMainThread(^{
+-        ret = [[WineApplicationController sharedController] setCursorPosition:cgpoint_mac_from_win(pos)];
++        ret = [[WineApplicationController sharedController] setCursorPosition:ef_notch_physical_point([NSApp keyWindow], cgpoint_mac_from_win(pos))];
+     });
+ 
+     return ret;
+@@ -2844,7 +2848,7 @@ int macdrv_clip_cursor(CGRect r)
+         CGRect rect = r;
+ 
+         if (!CGRectIsInfinite(rect))
+-            rect = cgrect_mac_from_win(rect);
++            rect = ef_notch_physical_rect([NSApp keyWindow], cgrect_mac_from_win(rect));
+ 
+         if (!CGRectIsInfinite(rect))
+         {
+diff --git a/dlls/winemac.drv/cocoa_event.m b/dlls/winemac.drv/cocoa_event.m
+index 7c86fc1d..890ed157 100644
+--- a/dlls/winemac.drv/cocoa_event.m
++++ b/dlls/winemac.drv/cocoa_event.m
+@@ -27,6 +27,7 @@
+ #import "cocoa_event.h"
+ #import "cocoa_app.h"
+ #import "cocoa_window.h"
++#import "endfield_coords.h"
+ 
+ #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+ 
+@@ -347,21 +348,22 @@ - (void) resetMouseEventPositions:(CGPoint)pos
+     {
+         MacDrvEvent* event;
+ 
+-        pos = cgpoint_win_from_mac(pos);
+ 
+         [eventsLock lock];
+ 
+         for (event in events)
+         {
++            /* Use each queued event's target, not a possibly changed key window. */
++            CGPoint logical = cgpoint_win_from_mac(ef_notch_logical_point((NSWindow *)event->event->window, pos));
+             if (event->event->type == MOUSE_BUTTON)
+             {
+-                event->event->mouse_button.x = pos.x;
+-                event->event->mouse_button.y = pos.y;
++                event->event->mouse_button.x = logical.x;
++                event->event->mouse_button.y = logical.y;
+             }
+             else if (event->event->type == MOUSE_SCROLL)
+             {
+-                event->event->mouse_scroll.x = pos.x;
+-                event->event->mouse_scroll.y = pos.y;
++                event->event->mouse_scroll.x = logical.x;
++                event->event->mouse_scroll.y = logical.y;
+             }
+         }
+ 
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+index ffb7c6af..070c5002 100644
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -27,6 +27,7 @@
+ #include <dlfcn.h>
+ 
+ #import "cocoa_window.h"
++#import "endfield_coords.h"
+ 
+ #include "macdrv_cocoa.h"
+ #import "cocoa_app.h"
+@@ -3633,7 +3634,7 @@ void macdrv_get_cocoa_window_frame(macdrv_window w, CGRect* out_frame)
+ 
+         frame = [window contentRectForFrameRect:[window wine_fractionalFrame]];
+         [[WineApplicationController sharedController] flipRect:&frame];
+-        *out_frame = cgrect_win_from_mac(NSRectToCGRect(frame));
++        *out_frame = cgrect_win_from_mac(ef_notch_logical_rect(window, NSRectToCGRect(frame)));
+     });
+ }
+ 
+diff --git a/dlls/winemac.drv/endfield_coords.h b/dlls/winemac.drv/endfield_coords.h
+new file mode 100644
+--- /dev/null
++++ b/dlls/winemac.drv/endfield_coords.h
+@@ -0,0 +1,46 @@
++/* Optional, process-local coordinate bridge for the isolated Endfield host.
++ * No selector implementation is installed in other applications.  All calls
++ * occur on the Cocoa main thread, after physical hit testing and clipping.
++ */
++#import <AppKit/AppKit.h>
++
++@protocol EFNotchCoordinates
++- (CGPoint)efNotchLogicalPointForPhysicalPoint:(CGPoint)point;
++- (CGPoint)efNotchPhysicalPointForLogicalPoint:(CGPoint)point;
++- (CGRect)efNotchLogicalRectForPhysicalRect:(CGRect)rect;
++@end
++
++static inline CGPoint ef_notch_logical_point(NSWindow *window, CGPoint point)
++{
++    if ([window respondsToSelector:@selector(efNotchLogicalPointForPhysicalPoint:)])
++        return [(id<EFNotchCoordinates>)window efNotchLogicalPointForPhysicalPoint:point];
++    return point;
++}
++
++static inline CGPoint ef_notch_physical_point(NSWindow *window, CGPoint point)
++{
++    if ([window respondsToSelector:@selector(efNotchPhysicalPointForLogicalPoint:)])
++        return [(id<EFNotchCoordinates>)window efNotchPhysicalPointForLogicalPoint:point];
++    return point;
++}
++
++static inline CGRect ef_notch_logical_rect(NSWindow *window, CGRect rect)
++{
++    if ([window respondsToSelector:@selector(efNotchLogicalRectForPhysicalRect:)])
++        return [(id<EFNotchCoordinates>)window efNotchLogicalRectForPhysicalRect:rect];
++    return rect;
++}
++
++static inline CGRect ef_notch_physical_rect(NSWindow *window, CGRect rect)
++{
++    CGPoint a = ef_notch_physical_point(window, rect.origin);
++    CGPoint b = ef_notch_physical_point(window, CGPointMake(CGRectGetMaxX(rect), CGRectGetMaxY(rect)));
++    return CGRectMake(a.x, a.y, b.x - a.x, b.y - a.y);
++}
++
++static inline CGPoint ef_notch_delta_scale(NSWindow *window)
++{
++    CGPoint a = ef_notch_logical_point(window, CGPointZero);
++    CGPoint b = ef_notch_logical_point(window, CGPointMake(1, 1));
++    return CGPointMake(b.x - a.x, b.y - a.y);
++}

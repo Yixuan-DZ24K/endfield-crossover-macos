@@ -1,0 +1,12 @@
+diff --git a/loader/wine_info.plist.in b/loader/wine_info.plist.in
+index beb1c33b..9751f75e 100644
+--- a/loader/wine_info.plist.in
++++ b/loader/wine_info.plist.in
+@@ -26,5 +26,7 @@
+     <string>WineApplication</string>
+     <key>LSUIElement</key>
+     <string>1</string>
++    <key>NSPrefersDisplaySafeAreaCompatibilityMode</key>
++    <true/>
+ </dict>
+ </plist>
